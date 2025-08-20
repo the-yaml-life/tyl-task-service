@@ -1,0 +1,43 @@
+# Production Environment Configuration
+
+[service]
+name = "tyl-{microservice-name}"
+version = "1.0.0"
+
+[api]
+host = "0.0.0.0"
+port = 3000
+request_timeout_ms = 30000
+max_request_size = 1048576
+
+[database]
+# Configure for your production database
+# url = "postgres://prod_user:prod_pass@db.example.com:5432/prod_db"
+# max_connections = 20
+# connection_timeout_ms = 10000
+# query_timeout_ms = 30000
+
+[external]
+timeout_ms = 15000
+retry_attempts = 5
+retry_delay_ms = 2000
+
+[monitoring]
+metrics_enabled = true
+tracing_enabled = true
+health_check_enabled = true
+
+# Production-specific settings
+[logging]
+level = "info"
+format = "json"
+
+[cors]
+allowed_origins = ["https://yourdomain.com"]
+allowed_methods = ["GET", "POST", "PUT", "DELETE"]
+allowed_headers = ["content-type", "authorization", "x-correlation-id"]
+
+[security]
+# Production security settings
+rate_limit_per_minute = 1000
+max_concurrent_requests = 100
