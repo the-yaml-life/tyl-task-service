@@ -1,0 +1,44 @@
+# Build outputs
+target/
+logs/
+*.log
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Git
+.git/
+.gitignore
+
+# Documentation and dev files
+*.md
+TEMPLATE.md
+CHANGELOG.md
+LICENSE
+
+# Scripts and development tools
+scripts/
+docker/
+*.sh
+
+# Test files (exclude for production builds)
+tests/
+examples/
+
+# Development config (only include specific configs in Dockerfile)
+clippy.toml
+rustfmt.toml
+.env*
+
+# Docker files themselves
+Dockerfile*
+docker-compose*.yml
+.dockerignore

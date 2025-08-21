@@ -1,0 +1,400 @@
+name: Automated Release
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      version_bump:
+        description: 'Version bump type'
+        required: true
+        default: 'patch'
+        type: choice
+        options:
+        - patch
+        - minor
+        - major
+      prerelease:
+        description: 'Create prerelease'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  packages: write
+  pull-requests: write
+
+jobs:
+  # ==========================================
+  # Determine Release Type
+  # ==========================================
+  determine-release:
+    name: Determine Release Type
+    runs-on: ubuntu-latest
+    outputs:
+      should-release: ${{ steps.check.outputs.should-release }}
+      version-bump: ${{ steps.check.outputs.version-bump }}
+      is-prerelease: ${{ steps.check.outputs.is-prerelease }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Determine if release is needed
+      id: check
+      run: |
+        # Check if this is a manual workflow dispatch
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          echo "should-release=true" >> $GITHUB_OUTPUT
+          echo "version-bump=${{ github.event.inputs.version_bump }}" >> $GITHUB_OUTPUT
+          echo "is-prerelease=${{ github.event.inputs.prerelease }}" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+        
+        # For push events, analyze commit messages
+        COMMITS=$(git log $(git describe --tags --abbrev=0)..HEAD --oneline || git log --oneline)
+        
+        # Determine version bump based on conventional commits
+        if echo "$COMMITS" | grep -qE "^[a-f0-9]+ (feat|feature)(\(.+\))?!:"; then
+          echo "version-bump=major" >> $GITHUB_OUTPUT
+        elif echo "$COMMITS" | grep -qE "^[a-f0-9]+ (feat|feature)(\(.+\))?:"; then
+          echo "version-bump=minor" >> $GITHUB_OUTPUT
+        elif echo "$COMMITS" | grep -qE "^[a-f0-9]+ (fix|bugfix|hotfix)(\(.+\))?:"; then
+          echo "version-bump=patch" >> $GITHUB_OUTPUT
+        else
+          # No release needed for other commit types
+          echo "should-release=false" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+        
+        echo "should-release=true" >> $GITHUB_OUTPUT
+        echo "is-prerelease=false" >> $GITHUB_OUTPUT
+
+  # ==========================================
+  # Create Release
+  # ==========================================
+  create-release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    needs: [determine-release]
+    if: needs.determine-release.outputs.should-release == 'true'
+
+    outputs:
+      new-version: ${{ steps.version.outputs.new-version }}
+      release-created: ${{ steps.release.outputs.release_created }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        fetch-depth: 0
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+
+    - name: Install semver
+      run: npm install -g semver
+
+    - name: Calculate new version
+      id: version
+      run: |
+        # Get current version from Cargo.toml
+        CURRENT_VERSION=$(grep '^version = ' Cargo.toml | head -n1 | cut -d'"' -f2)
+        echo "Current version: $CURRENT_VERSION"
+        
+        # Calculate new version
+        NEW_VERSION=$(semver -i ${{ needs.determine-release.outputs.version-bump }} $CURRENT_VERSION)
+        echo "New version: $NEW_VERSION"
+        echo "new-version=$NEW_VERSION" >> $GITHUB_OUTPUT
+        
+        # Update Cargo.toml
+        sed -i "s/^version = \".*\"/version = \"$NEW_VERSION\"/" Cargo.toml
+        
+        # Update lockfile
+        cargo check
+
+    - name: Generate changelog
+      id: changelog
+      run: |
+        # Get commits since last tag
+        LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+        if [ -z "$LAST_TAG" ]; then
+          COMMITS=$(git log --oneline --pretty=format:"- %s (%h)")
+        else
+          COMMITS=$(git log ${LAST_TAG}..HEAD --oneline --pretty=format:"- %s (%h)")
+        fi
+        
+        # Create changelog
+        cat > RELEASE_CHANGELOG.md << 'EOF'
+        ## What's Changed
+        
+        EOF
+        echo "$COMMITS" >> RELEASE_CHANGELOG.md
+        
+        # Add contributors
+        echo "" >> RELEASE_CHANGELOG.md
+        echo "## Contributors" >> RELEASE_CHANGELOG.md
+        git log ${LAST_TAG}..HEAD --pretty=format:"- @%an" | sort | uniq >> RELEASE_CHANGELOG.md
+        
+        echo "changelog<<EOF" >> $GITHUB_OUTPUT
+        cat RELEASE_CHANGELOG.md >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+
+    - name: Commit version bump
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        git add Cargo.toml Cargo.lock
+        git commit -m "chore: bump version to ${{ steps.version.outputs.new-version }}"
+        git push
+
+    - name: Create release
+      id: release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: v${{ steps.version.outputs.new-version }}
+        name: TYL Task Service v${{ steps.version.outputs.new-version }}
+        body: ${{ steps.changelog.outputs.changelog }}
+        draft: false
+        prerelease: ${{ needs.determine-release.outputs.is-prerelease }}
+        generate_release_notes: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ==========================================
+  # Build and Attach Release Artifacts
+  # ==========================================
+  build-release-artifacts:
+    name: Build Release Artifacts
+    runs-on: ubuntu-latest
+    needs: [create-release]
+    if: needs.create-release.outputs.release-created == 'true'
+    
+    strategy:
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-gnu
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        ref: v${{ needs.create-release.outputs.new-version }}
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ matrix.target }}
+
+    - name: Install cross-compilation dependencies
+      run: |
+        sudo apt-get update
+        if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+        fi
+        if [ "${{ matrix.target }}" = "x86_64-unknown-linux-musl" ]; then
+          sudo apt-get install -y musl-tools
+        fi
+
+    - name: Cache Rust dependencies
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/bin/
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+          target/
+        key: ${{ runner.os }}-cargo-release-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Build release binary
+      run: |
+        if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+          export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+        fi
+        cargo build --release --target ${{ matrix.target }}
+
+    - name: Create release package
+      run: |
+        cd target/${{ matrix.target }}/release
+        
+        # Create package directory
+        mkdir -p package/tyl-task-service-${{ needs.create-release.outputs.new-version }}-${{ matrix.target }}
+        
+        # Copy binary
+        cp tyl-task-service package/tyl-task-service-${{ needs.create-release.outputs.new-version }}-${{ matrix.target }}/
+        
+        # Copy additional files
+        cd ../../..
+        cp README.md package/tyl-task-service-${{ needs.create-release.outputs.new-version }}-${{ matrix.target }}/
+        cp LICENSE package/tyl-task-service-${{ needs.create-release.outputs.new-version }}-${{ matrix.target }}/ || echo "No LICENSE file"
+        cp -r config/ package/tyl-task-service-${{ needs.create-release.outputs.new-version }}-${{ matrix.target }}/ || echo "No config directory"
+        
+        # Create install script
+        cat > package/tyl-task-service-${{ needs.create-release.outputs.new-version }}-${{ matrix.target }}/install.sh << 'INSTALL_EOF'
+        #!/bin/bash
+        # TYL Task Service Installation Script
+        
+        set -e
+        
+        echo "🚀 Installing TYL Task Service v${{ needs.create-release.outputs.new-version }}"
+        
+        # Create installation directory
+        INSTALL_DIR="/opt/tyl-task-service"
+        sudo mkdir -p $INSTALL_DIR
+        
+        # Copy files
+        sudo cp tyl-task-service $INSTALL_DIR/
+        sudo cp -r config/ $INSTALL_DIR/ 2>/dev/null || echo "No config to copy"
+        sudo chmod +x $INSTALL_DIR/tyl-task-service
+        
+        # Create symlink
+        sudo ln -sf $INSTALL_DIR/tyl-task-service /usr/local/bin/tyl-task-service
+        
+        # Create systemd service
+        sudo tee /etc/systemd/system/tyl-task-service.service > /dev/null << 'SERVICE_EOF'
+        [Unit]
+        Description=TYL Task Service
+        After=network.target
+        
+        [Service]
+        Type=simple
+        User=tyl-task-service
+        Group=tyl-task-service
+        WorkingDirectory=/opt/tyl-task-service
+        ExecStart=/opt/tyl-task-service/tyl-task-service
+        Restart=always
+        RestartSec=5
+        
+        [Install]
+        WantedBy=multi-user.target
+        SERVICE_EOF
+        
+        # Create user
+        sudo useradd -r -s /bin/false tyl-task-service 2>/dev/null || echo "User already exists"
+        sudo chown -R tyl-task-service:tyl-task-service /opt/tyl-task-service
+        
+        # Reload systemd
+        sudo systemctl daemon-reload
+        sudo systemctl enable tyl-task-service
+        
+        echo "✅ Installation completed!"
+        echo "📋 Next steps:"
+        echo "   1. Configure: sudo nano /opt/tyl-task-service/config/production.toml"
+        echo "   2. Start: sudo systemctl start tyl-task-service"
+        echo "   3. Check: sudo systemctl status tyl-task-service"
+        INSTALL_EOF
+        
+        chmod +x package/tyl-task-service-${{ needs.create-release.outputs.new-version }}-${{ matrix.target }}/install.sh
+        
+        # Create tarball
+        cd package
+        tar -czf tyl-task-service-${{ needs.create-release.outputs.new-version }}-${{ matrix.target }}.tar.gz tyl-task-service-${{ needs.create-release.outputs.new-version }}-${{ matrix.target }}/
+        
+        # Generate checksums
+        sha256sum tyl-task-service-${{ needs.create-release.outputs.new-version }}-${{ matrix.target }}.tar.gz > tyl-task-service-${{ needs.create-release.outputs.new-version }}-${{ matrix.target }}.tar.gz.sha256
+
+    - name: Upload release asset
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: v${{ needs.create-release.outputs.new-version }}
+        files: |
+          target/${{ matrix.target }}/release/package/tyl-task-service-${{ needs.create-release.outputs.new-version }}-${{ matrix.target }}.tar.gz
+          target/${{ matrix.target }}/release/package/tyl-task-service-${{ needs.create-release.outputs.new-version }}-${{ matrix.target }}.tar.gz.sha256
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ==========================================
+  # Docker Release
+  # ==========================================
+  docker-release:
+    name: Docker Release
+    needs: [create-release]
+    if: needs.create-release.outputs.release-created == 'true'
+    uses: ./.github/workflows/docker-release.yml
+    secrets: inherit
+
+  # ==========================================
+  # Post-Release Actions
+  # ==========================================
+  post-release:
+    name: Post-Release Actions
+    runs-on: ubuntu-latest
+    needs: [create-release, build-release-artifacts, docker-release]
+    if: always() && needs.create-release.outputs.release-created == 'true'
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Create post-release summary
+      run: |
+        cat > release-summary.md << 'EOF'
+        # 🎉 TYL Task Service v${{ needs.create-release.outputs.new-version }} Released!
+        
+        ## 📦 Release Artifacts
+        
+        ### Binary Releases
+        - Linux x86_64 (GNU): `tyl-task-service-${{ needs.create-release.outputs.new-version }}-x86_64-unknown-linux-gnu.tar.gz`
+        - Linux x86_64 (musl): `tyl-task-service-${{ needs.create-release.outputs.new-version }}-x86_64-unknown-linux-musl.tar.gz`
+        - Linux ARM64: `tyl-task-service-${{ needs.create-release.outputs.new-version }}-aarch64-unknown-linux-gnu.tar.gz`
+        
+        ### Docker Images
+        - `ghcr.io/${{ github.repository }}:v${{ needs.create-release.outputs.new-version }}`
+        - `ghcr.io/${{ github.repository }}:latest`
+        
+        ### Docker Deployment Package
+        - Complete deployment package with scripts and documentation
+        - Available in release assets as `docker-artifacts.tar.gz`
+        
+        ## 🚀 Quick Start
+        
+        ### Using Docker
+        ```bash
+        docker run -p 3000:3000 ghcr.io/${{ github.repository }}:v${{ needs.create-release.outputs.new-version }}
+        ```
+        
+        ### Using Binary
+        ```bash
+        wget https://github.com/${{ github.repository }}/releases/download/v${{ needs.create-release.outputs.new-version }}/tyl-task-service-${{ needs.create-release.outputs.new-version }}-x86_64-unknown-linux-gnu.tar.gz
+        tar -xzf tyl-task-service-${{ needs.create-release.outputs.new-version }}-x86_64-unknown-linux-gnu.tar.gz
+        cd tyl-task-service-${{ needs.create-release.outputs.new-version }}-x86_64-unknown-linux-gnu
+        sudo ./install.sh
+        ```
+        
+        ## 📋 Verification
+        
+        All artifacts include SHA256 checksums for verification.
+        
+        ```bash
+        # Verify checksum
+        sha256sum -c tyl-task-service-*.tar.gz.sha256
+        ```
+        
+        ## 🔗 Links
+        
+        - [Release Notes](https://github.com/${{ github.repository }}/releases/tag/v${{ needs.create-release.outputs.new-version }})
+        - [Documentation](https://github.com/${{ github.repository }}/blob/main/README.md)
+        - [Docker Hub](https://ghcr.io/${{ github.repository }})
+        EOF
+
+    - name: Update repository README (if needed)
+      run: |
+        # Update version badge in README
+        if [ -f README.md ]; then
+          sed -i "s/version-[^-]*-blue/version-${{ needs.create-release.outputs.new-version }}-blue/g" README.md || echo "No version badge to update"
+        fi
+
+    - name: Notify about release
+      run: |
+        echo "🎉 Release v${{ needs.create-release.outputs.new-version }} has been created successfully!"
+        echo "📦 Artifacts available at: https://github.com/${{ github.repository }}/releases/tag/v${{ needs.create-release.outputs.new-version }}"
+        echo "🐳 Docker image: ghcr.io/${{ github.repository }}:v${{ needs.create-release.outputs.new-version }}"

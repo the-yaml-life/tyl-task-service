@@ -5,14 +5,14 @@
 use axum::{
     extract::{Path, State},
     http::StatusCode,
-    response::Json,
+    response::{Json, IntoResponse},
 };
 use serde::{Deserialize, Serialize};
 use tracing::{info, error};
 
 use crate::{
     AppState, 
-    domain::{CreateTaskRequest, TaskResponse, UpdateTaskRequest, Task},
+    domain::{CreateTaskRequest, TaskDetailResponse, UpdateTaskRequest, Task},
     utils::generate_correlation_id,
 };
 
@@ -52,6 +52,48 @@ impl ApiError {
             timestamp: chrono::Utc::now(),
         }
     }
+    
+    pub fn not_found(resource: impl Into<String>, id: impl Into<String>) -> Self {
+        Self::new(
+            "NOT_FOUND",
+            format!("{} with id '{}' not found", resource.into(), id.into())
+        )
+    }
+    
+    pub fn internal_error(message: impl Into<String>) -> Self {
+        Self::new("INTERNAL_ERROR", message)
+    }
+    
+    pub fn internal_server_error(message: impl Into<String>) -> Self {
+        Self::new("INTERNAL_SERVER_ERROR", message)
+    }
+    
+    pub fn service_unavailable(message: impl Into<String>) -> Self {
+        Self::new("SERVICE_UNAVAILABLE", message)
+    }
+}
+
+impl From<tyl_errors::TylError> for ApiError {
+    fn from(err: tyl_errors::TylError) -> Self {
+        Self::new("DOMAIN_ERROR", err.to_string())
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> axum::response::Response {
+        let status_code = match self.error.as_str() {
+            "NOT_FOUND" => StatusCode::NOT_FOUND,
+            "BAD_REQUEST" => StatusCode::BAD_REQUEST,
+            "UNAUTHORIZED" => StatusCode::UNAUTHORIZED,
+            "FORBIDDEN" => StatusCode::FORBIDDEN,
+            "CONFLICT" => StatusCode::CONFLICT,
+            "UNPROCESSABLE_ENTITY" => StatusCode::UNPROCESSABLE_ENTITY,
+            "SERVICE_UNAVAILABLE" => StatusCode::SERVICE_UNAVAILABLE,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        
+        (status_code, Json(self)).into_response()
+    }
 }
 
 /// Main business operation endpoint
@@ -60,16 +102,16 @@ impl ApiError {
 pub async fn process_request(
     State(state): State<AppState>,
     Json(request): Json<CreateTaskRequest>,
-) -> Result<Json<ApiResponse<TaskResponse>>, (StatusCode, Json<ApiError>)> {
+) -> Result<Json<ApiResponse<TaskDetailResponse>>, (StatusCode, Json<ApiError>)> {
     let correlation_id = generate_correlation_id();
     
     info!(
         correlation_id = %correlation_id,
-        request_email = %request.email,
+        request_name = %request.name,
         "Processing business request"
     );
 
-    match state.domain_service.process(request).await {
+    match state.domain_service.create_task(request).await {
         Ok(response) => {
             info!(
                 correlation_id = %correlation_id,
@@ -77,7 +119,7 @@ pub async fn process_request(
                 "Request processed successfully"
             );
             
-            Ok(Json(ApiResponse::new(response)))
+            Ok(Json(ApiResponse::new(TaskDetailResponse::new(response))))
         }
         Err(e) => {
             error!(
@@ -109,7 +151,7 @@ pub async fn get_entity(
         "Getting entity by ID"
     );
 
-    match state.domain_service.get_by_id(&id).await {
+    match state.domain_service.get_task_by_id(&id).await {
         Ok(Some(entity)) => {
             info!(
                 correlation_id = %correlation_id,
@@ -158,11 +200,11 @@ pub async fn create_entity(
     
     info!(
         correlation_id = %correlation_id,
-        entity_email = %request.email,
+        entity_name = %request.name,
         "Creating new entity"
     );
 
-    match state.domain_service.create(request).await {
+    match state.domain_service.create_task(request).await {
         Ok(entity) => {
             info!(
                 correlation_id = %correlation_id,
@@ -203,7 +245,7 @@ pub async fn update_entity(
         "Updating entity"
     );
 
-    match state.domain_service.update(&id, request).await {
+    match state.domain_service.update_task(&id, request).await {
         Ok(entity) => {
             info!(
                 correlation_id = %correlation_id,
@@ -244,7 +286,7 @@ pub async fn delete_entity(
         "Deleting entity"
     );
 
-    match state.domain_service.delete(&id).await {
+    match state.domain_service.delete_task(&id).await {
         Ok(()) => {
             info!(
                 correlation_id = %correlation_id,
@@ -273,7 +315,7 @@ pub async fn delete_entity(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{TaskServiceConfig, domain::MockTaskService, events::EventService};
+    use crate::{TaskServiceConfig, domain::{MockTaskService, TaskContext, TaskPriority, TaskComplexity, TaskSource, TaskVisibility}, events::EventService};
     use std::sync::Arc;
 
     async fn create_test_state() -> AppState {
@@ -282,6 +324,7 @@ mod tests {
             domain_service: Arc::new(MockTaskService::new()),
             event_service: Arc::new(EventService::new().await.unwrap()),
             logger: Arc::new(tyl_logging::loggers::console::ConsoleLogger::new()),
+            tracer: Arc::new(tyl_tracing::SimpleTracer::new(tyl_tracing::TraceConfig::new("test-service"))),
         }
     }
 
@@ -289,17 +332,30 @@ mod tests {
     async fn test_process_request() {
         let state = create_test_state().await;
         let request = CreateTaskRequest {
-            email: "test@example.com".to_string(),
-            username: "testuser".to_string(),
-            full_name: Some("Test Task".to_string()),
-            password: "password123".to_string(),
+            id: "TEST-001".to_string(),
+            name: "Test Task".to_string(),
+            description: Some("A test task".to_string()),
+            context: TaskContext::Work,
+            priority: TaskPriority::Medium,
+            complexity: TaskComplexity::Simple,
+            due_date: None,
+            estimated_date: None,
+            implementation_details: None,
+            success_criteria: vec![],
+            test_strategy: None,
+            source: TaskSource::Self_,
+            visibility: TaskVisibility::Private,
+            recurrence: None,
+            custom_properties: std::collections::HashMap::new(),
+            assigned_user_id: None,
+            project_id: None,
         };
         
         let result = process_request(State(state), Json(request)).await;
         assert!(result.is_ok());
         
         let response = result.unwrap();
-        assert!(response.data.message.contains("Processed"));
+        assert_eq!(response.data.task.name, "Test Task");
     }
 
     #[tokio::test]
@@ -309,7 +365,7 @@ mod tests {
         
         assert!(result.is_ok());
         let response = result.unwrap();
-        assert_eq!(response.data.username, "testuser");
+        assert_eq!(response.data.name, "Test Task");
     }
 
     #[tokio::test]
@@ -326,27 +382,47 @@ mod tests {
     async fn test_create_entity() {
         let state = create_test_state().await;
         let request = CreateTaskRequest {
-            email: "new@example.com".to_string(),
-            username: "newuser".to_string(),
-            full_name: Some("New Task".to_string()),
-            password: "password123".to_string(),
+            id: "CREATE-001".to_string(),
+            name: "New Task".to_string(),
+            description: Some("A new task".to_string()),
+            context: TaskContext::Work,
+            priority: TaskPriority::High,
+            complexity: TaskComplexity::Simple,
+            due_date: None,
+            estimated_date: None,
+            implementation_details: None,
+            success_criteria: vec![],
+            test_strategy: None,
+            source: TaskSource::Self_,
+            visibility: TaskVisibility::Private,
+            recurrence: None,
+            custom_properties: std::collections::HashMap::new(),
+            assigned_user_id: None,
+            project_id: None,
         };
         
         let result = create_entity(State(state), Json(request)).await;
         assert!(result.is_ok());
         
         let response = result.unwrap();
-        assert_eq!(response.data.username, "newuser");
+        assert_eq!(response.data.name, "New Task");
     }
 
     #[tokio::test]
     async fn test_update_entity() {
         let state = create_test_state().await;
         let request = UpdateTaskRequest {
-            email: Some("updated@example.com".to_string()),
-            username: Some("updateduser".to_string()),
-            full_name: Some("Updated Task".to_string()),
-            status: None,
+            name: Some("Updated Task".to_string()),
+            description: Some("Updated description".to_string()),
+            priority: Some(TaskPriority::Critical),
+            complexity: None,
+            due_date: None,
+            estimated_date: None,
+            implementation_details: None,
+            success_criteria: None,
+            test_strategy: None,
+            visibility: None,
+            custom_properties: None,
         };
         
         let result = update_entity(State(state), Path("test-id".to_string()), Json(request)).await;

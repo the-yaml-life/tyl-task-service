@@ -11,7 +11,12 @@ use axum::{
 use crate::{
     handlers::{
         health::{health_check, readiness_check, liveness_check, health_detail},
-        api::{process_request, get_entity, create_entity, update_entity, delete_entity},
+        tasks::{
+            create_task, get_task, update_task, delete_task, list_tasks,
+            transition_task_status, add_task_dependency, get_task_dependencies,
+            assign_task, get_assigned_tasks, get_actionable_tasks, get_overdue_tasks,
+            get_task_analytics, add_subtask, get_subtasks, get_circular_dependencies
+        },
     },
     AppState,
 };
@@ -27,19 +32,38 @@ pub fn health_routes() -> Router<AppState> {
         .route("/health/detail", get(health_detail))
 }
 
-/// Create API routes for business logic
+/// Create API routes for task management
 /// 
-/// These routes implement the main business functionality of the microservice.
+/// These routes implement the complete task management functionality.
 pub fn api_routes() -> Router<AppState> {
     Router::new()
-        // Main business operation
-        .route("/api/v1/process", post(process_request))
+        // Core task CRUD operations
+        .route("/api/v1/tasks", post(create_task))
+        .route("/api/v1/tasks", get(list_tasks))
+        .route("/api/v1/tasks/:id", get(get_task))
+        .route("/api/v1/tasks/:id", put(update_task))
+        .route("/api/v1/tasks/:id", delete(delete_task))
         
-        // CRUD operations for entities
-        .route("/api/v1/entities", post(create_entity))
-        .route("/api/v1/entities/:id", get(get_entity))
-        .route("/api/v1/entities/:id", put(update_entity))
-        .route("/api/v1/entities/:id", delete(delete_entity))
+        // Task status management
+        .route("/api/v1/tasks/:id/status", post(transition_task_status))
+        
+        // Task dependencies
+        .route("/api/v1/tasks/:id/dependencies", post(add_task_dependency))
+        .route("/api/v1/tasks/:id/dependencies", get(get_task_dependencies))
+        
+        // Task hierarchy (subtasks)
+        .route("/api/v1/tasks/:parent_id/subtasks/:child_id", post(add_subtask))
+        .route("/api/v1/tasks/:parent_id/subtasks", get(get_subtasks))
+        
+        // Task assignment
+        .route("/api/v1/tasks/:id/assign", post(assign_task))
+        
+        // Task queries and analytics
+        .route("/api/v1/tasks/:id/analytics", get(get_task_analytics))
+        .route("/api/v1/users/:user_id/tasks", get(get_assigned_tasks))
+        .route("/api/v1/users/:user_id/tasks/actionable", get(get_actionable_tasks))
+        .route("/api/v1/tasks/overdue", get(get_overdue_tasks))
+        .route("/api/v1/tasks/circular-dependencies", get(get_circular_dependencies))
 }
 
 /// Create the complete router with all routes
@@ -64,6 +88,7 @@ mod tests {
             domain_service: Arc::new(MockTaskService::new()),
             event_service: Arc::new(EventService::new().await.unwrap()),
             logger: Arc::new(tyl_logging::loggers::console::ConsoleLogger::new()),
+            tracer: Arc::new(tyl_tracing::SimpleTracer::new(tyl_tracing::TraceConfig::new("test-service"))),
         };
 
         create_router().with_state(state)
@@ -99,51 +124,51 @@ mod tests {
         let app = create_test_app().await;
         let server = TestServer::new(app).unwrap();
 
-        // Test process endpoint
-        let response = server
-            .post("/api/v1/process")
+        // Test create task
+        let create_response = server
+            .post("/api/v1/tasks")
             .json(&serde_json::json!({
-                "email": "test@example.com",
-                "username": "testuser",
-                "full_name": "Test Task",
-                "password": "password123"
+                "name": "Test Task",
+                "description": "A test task",
+                "context": "work",
+                "priority": "medium",
+                "complexity": "simple"
             }))
             .await;
+        create_response.assert_status_ok();
+        
+        // Extract the created task ID from the response
+        let create_json: serde_json::Value = create_response.json();
+        
+        // Try different possible JSON paths for the task ID
+        let task_id = create_json["id"].as_str()
+            .or_else(|| create_json["data"]["id"].as_str())
+            .expect(&format!("Could not find task ID in response: {}", create_json));
+
+        // Test list tasks
+        let response = server.get("/api/v1/tasks").await;
         response.assert_status_ok();
 
-        // Test create entity
-        let response = server
-            .post("/api/v1/entities")
-            .json(&serde_json::json!({
-                "email": "test@example.com",
-                "username": "testuser",
-                "full_name": "Test Task",
-                "password": "password123"
-            }))
-            .await;
+        // Test get task (existing)
+        let response = server.get(&format!("/api/v1/tasks/{}", task_id)).await;
         response.assert_status_ok();
 
-        // Test get entity (existing)
-        let response = server.get("/api/v1/entities/test-id").await;
-        response.assert_status_ok();
-
-        // Test get entity (non-existent)
-        let response = server.get("/api/v1/entities/non-existent").await;
+        // Test get task (non-existent)
+        let response = server.get("/api/v1/tasks/non-existent").await;
         response.assert_status_not_found();
 
-        // Test update entity
+        // Test update task
         let response = server
-            .put("/api/v1/entities/test-id")
+            .put(&format!("/api/v1/tasks/{}", task_id))
             .json(&serde_json::json!({
-                "email": "updated@example.com",
-                "username": "updateduser",
-                "full_name": "Updated Task"
+                "name": "Updated Test Task",
+                "description": "Updated description"
             }))
             .await;
         response.assert_status_ok();
 
-        // Test delete entity
-        let response = server.delete("/api/v1/entities/test-id").await;
+        // Test delete task
+        let response = server.delete(&format!("/api/v1/tasks/{}", task_id)).await;
         response.assert_status(StatusCode::NO_CONTENT);
     }
 }

@@ -108,7 +108,7 @@ impl TaskRepository for PostgresTaskRepository {
         
         // For template purposes, return mock data
         if id == "test-id" {
-            Ok(Some(Task::new("test@example.com", "testuser")))
+            Ok(Some(Task::new("test@example.com".to_string(), "testuser".to_string(), crate::domain::TaskContext::Work)))
         } else {
             Ok(None)
         }
@@ -237,7 +237,7 @@ impl TaskRepository for InMemoryTaskRepository {
     async fn find_by_id(&self, id: &str) -> TaskServiceResult<Option<Task>> {
         // Implement in-memory lookup
         if id == "test-id" {
-            Ok(Some(Task::new("test@example.com", "testuser")))
+            Ok(Some(Task::new("test@example.com".to_string(), "testuser".to_string(), crate::domain::TaskContext::Work)))
         } else {
             Ok(None)
         }
@@ -285,7 +285,7 @@ mod tests {
         assert!(result.is_none());
         
         // Test save
-        let task = Task::new("test@example.com", "testuser");
+        let task = Task::new("test@example.com".to_string(), "testuser".to_string(), crate::domain::TaskContext::Work);
         let result = repo.save(&task).await;
         assert!(result.is_ok());
         

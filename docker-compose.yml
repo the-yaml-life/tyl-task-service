@@ -1,0 +1,123 @@
+services:
+  # Redis instance for FalkorDB
+  falkordb:
+    image: falkordb/falkordb:latest
+    container_name: tyl-task-falkordb
+    ports:
+      - "6379:6379"
+    volumes:
+      - falkordb_data:/data
+    command: ["redis-server", "--loadmodule", "/usr/lib/redis/modules/graphdb.so"]
+    environment:
+      - REDIS_ARGS=--requirepass taskservice123
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - tyl-task-network
+
+  # Redis for pub/sub (separate instance for events)
+  redis-pubsub:
+    image: redis:7-alpine
+    container_name: tyl-task-redis-pubsub
+    ports:
+      - "6380:6379"
+    volumes:
+      - redis_pubsub_data:/data
+    command: ["redis-server", "--requirepass", "pubsub123"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - tyl-task-network
+
+  # Task service
+  tyl-task-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: tyl-task-service
+    ports:
+      - "3000:3000"
+    environment:
+      # FalkorDB configuration
+      - FALKORDB_HOST=falkordb
+      - FALKORDB_PORT=6379
+      - FALKORDB_PASSWORD=taskservice123
+      - FALKORDB_DATABASE=0
+      - FALKORDB_GRAPH_NAME=task_management
+      
+      # Redis PubSub configuration
+      - REDIS_PUBSUB_HOST=redis-pubsub
+      - REDIS_PUBSUB_PORT=6379
+      - REDIS_PUBSUB_PASSWORD=pubsub123
+      
+      # Service configuration
+      - PORT=3000
+      - RUST_LOG=info,tyl_task_service=debug
+      - ENVIRONMENT=development
+      
+      # Health check intervals
+      - HEALTH_CHECK_INTERVAL=30s
+    depends_on:
+      falkordb:
+        condition: service_healthy
+      redis-pubsub:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - tyl-task-network
+    volumes:
+      - ./logs:/app/logs
+
+  # Test runner service (for integration tests)
+  tyl-task-test:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    container_name: tyl-task-test
+    environment:
+      # Test database configuration
+      - FALKORDB_HOST=falkordb
+      - FALKORDB_PORT=6379
+      - FALKORDB_PASSWORD=taskservice123
+      - FALKORDB_DATABASE=1  # Use different DB for tests
+      - FALKORDB_GRAPH_NAME=test_task_management
+      
+      - REDIS_PUBSUB_HOST=redis-pubsub
+      - REDIS_PUBSUB_PORT=6379
+      - REDIS_PUBSUB_PASSWORD=pubsub123
+      
+      - RUST_LOG=debug
+      - TEST_MODE=true
+    depends_on:
+      falkordb:
+        condition: service_healthy
+      redis-pubsub:
+        condition: service_healthy
+    networks:
+      - tyl-task-network
+    profiles:
+      - test
+    command: ["cargo", "test", "--", "--test-threads=1"]
+
+volumes:
+  falkordb_data:
+    driver: local
+  redis_pubsub_data:
+    driver: local
+
+networks:
+  tyl-task-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/16

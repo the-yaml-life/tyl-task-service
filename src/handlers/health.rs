@@ -9,7 +9,8 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::AppState;
+use crate::{AppState, LogLevel, LogRecord};
+use tokio::time::{timeout, Duration};
 
 /// Health check response
 #[derive(Debug, Serialize, Deserialize)]
@@ -35,8 +36,18 @@ pub struct HealthDetailResponse {
 /// Dependency health status
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DependencyHealth {
-    pub database: HealthStatus,
-    pub external_services: HealthStatus,
+    pub database: DependencyStatus,
+    pub event_system: DependencyStatus,
+    pub domain_service: DependencyStatus,
+}
+
+/// Individual dependency status with details
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DependencyStatus {
+    pub status: HealthStatus,
+    pub name: String,
+    pub message: Option<String>,
+    pub response_time_ms: Option<u64>,
 }
 
 /// Health status enumeration
@@ -117,52 +128,148 @@ pub async fn health_detail(State(state): State<AppState>) -> Json<HealthDetailRe
 
 /// Check if the service is ready to accept traffic
 async fn check_service_readiness(state: &AppState) -> bool {
-    // Add your readiness checks here:
-    // - Database connectivity
-    // - Required external services
-    // - Configuration validation
-    // - Cache warming
+    // Log readiness check start
+    state.logger.log(&LogRecord::new(LogLevel::Debug, "Starting service readiness check"));
     
-    // For template purposes, always return true
-    // In a real implementation, you would check actual dependencies
-    true
+    // Check all critical dependencies
+    let dependencies = check_dependencies(state).await;
+    
+    // Service is ready if database and event system are healthy
+    let is_ready = matches!(dependencies.database.status, HealthStatus::Healthy) &&
+                   matches!(dependencies.event_system.status, HealthStatus::Healthy) &&
+                   matches!(dependencies.domain_service.status, HealthStatus::Healthy);
+    
+    state.logger.log(&LogRecord::new(LogLevel::Info, 
+        &format!("Service readiness check result: {}", if is_ready { "ready" } else { "not ready" })));
+    
+    is_ready
 }
 
 /// Check the health of all dependencies
 async fn check_dependencies(state: &AppState) -> DependencyHealth {
+    // Run all dependency checks concurrently for better performance
+    let (database_result, event_system_result, domain_service_result) = tokio::join!(
+        check_database_health(state),
+        check_event_system_health(state),
+        check_domain_service_health(state)
+    );
+    
     DependencyHealth {
-        database: check_database_health(state).await,
-        external_services: check_external_services_health(state).await,
+        database: database_result,
+        event_system: event_system_result,
+        domain_service: domain_service_result,
     }
 }
 
 /// Check database health
-async fn check_database_health(state: &AppState) -> HealthStatus {
-    // Check database connectivity
-    // This would typically involve a simple query or ping
+async fn check_database_health(state: &AppState) -> DependencyStatus {
+    let start_time = std::time::Instant::now();
+    let db_name = format!("FalkorDB ({})", state.config.database.graph_name);
     
-    if state.config.database.is_some() {
-        // In a real implementation, you would test the database connection
-        HealthStatus::Healthy
-    } else {
-        HealthStatus::Unknown
+    // Try to perform a simple health check query with timeout
+    let health_check_result = timeout(Duration::from_secs(5), async {
+        // Try to create a simple test task to verify database connectivity
+        let test_filter = crate::domain::TaskFilter {
+            search_text: Some("health-check-non-existent".to_string()),
+            limit: Some(1),
+            ..Default::default()
+        };
+        
+        // This should return an empty result but proves database connectivity
+        state.domain_service.list_tasks(test_filter).await
+    }).await;
+    
+    let response_time = start_time.elapsed().as_millis() as u64;
+    
+    match health_check_result {
+        Ok(Ok(_)) => {
+            state.logger.log(&LogRecord::new(LogLevel::Debug, "Database health check: SUCCESS"));
+            DependencyStatus {
+                status: HealthStatus::Healthy,
+                name: db_name,
+                message: Some("Connection verified".to_string()),
+                response_time_ms: Some(response_time),
+            }
+        },
+        Ok(Err(e)) => {
+            let error_msg = format!("Database query failed: {}", e);
+            state.logger.log(&LogRecord::new(LogLevel::Error, &format!("Database health check: {}", error_msg)));
+            DependencyStatus {
+                status: HealthStatus::Unhealthy,
+                name: db_name,
+                message: Some(error_msg),
+                response_time_ms: Some(response_time),
+            }
+        },
+        Err(_) => {
+            let error_msg = "Database health check timeout (>5s)".to_string();
+            state.logger.log(&LogRecord::new(LogLevel::Error, &format!("Database health check: {}", error_msg)));
+            DependencyStatus {
+                status: HealthStatus::Unhealthy,
+                name: db_name,
+                message: Some(error_msg),
+                response_time_ms: Some(response_time),
+            }
+        }
     }
 }
 
-/// Check external services health
-async fn check_external_services_health(_state: &AppState) -> HealthStatus {
-    // Check external service connectivity
-    // This would typically involve health check requests to upstream services
+/// Check event system health
+async fn check_event_system_health(state: &AppState) -> DependencyStatus {
+    let start_time = std::time::Instant::now();
     
-    HealthStatus::Healthy
+    // Simple check - if event service is configured and available
+    let is_healthy = state.config.events.enabled;
+    let response_time = start_time.elapsed().as_millis() as u64;
+    
+    if is_healthy {
+        state.logger.log(&LogRecord::new(LogLevel::Debug, "Event system health check: SUCCESS"));
+        DependencyStatus {
+            status: HealthStatus::Healthy,
+            name: "Event System".to_string(),
+            message: Some("Event service is enabled and configured".to_string()),
+            response_time_ms: Some(response_time),
+        }
+    } else {
+        state.logger.log(&LogRecord::new(LogLevel::Warn, "Event system health check: DISABLED"));
+        DependencyStatus {
+            status: HealthStatus::Unknown,
+            name: "Event System".to_string(),
+            message: Some("Event service is disabled in configuration".to_string()),
+            response_time_ms: Some(response_time),
+        }
+    }
+}
+
+/// Check domain service health  
+async fn check_domain_service_health(state: &AppState) -> DependencyStatus {
+    let start_time = std::time::Instant::now();
+    
+    // The domain service is healthy if it's initialized and available
+    // Since we have it in our state, it's available
+    let response_time = start_time.elapsed().as_millis() as u64;
+    
+    state.logger.log(&LogRecord::new(LogLevel::Debug, "Domain service health check: SUCCESS"));
+    DependencyStatus {
+        status: HealthStatus::Healthy,
+        name: "Task Domain Service".to_string(), 
+        message: Some("Domain service is initialized and available".to_string()),
+        response_time_ms: Some(response_time),
+    }
 }
 
 /// Determine overall health status from dependencies
 fn determine_overall_status(dependencies: &DependencyHealth) -> String {
-    match (&dependencies.database, &dependencies.external_services) {
-        (HealthStatus::Healthy, HealthStatus::Healthy) => "healthy".to_string(),
-        (HealthStatus::Unknown, HealthStatus::Healthy) => "healthy".to_string(),
-        (HealthStatus::Healthy, HealthStatus::Unknown) => "healthy".to_string(),
+    let db_status = &dependencies.database.status;
+    let event_status = &dependencies.event_system.status; 
+    let domain_status = &dependencies.domain_service.status;
+    
+    // Service is healthy only if all critical components are healthy
+    match (db_status, event_status, domain_status) {
+        (HealthStatus::Healthy, HealthStatus::Healthy, HealthStatus::Healthy) => "healthy".to_string(),
+        (HealthStatus::Healthy, HealthStatus::Unknown, HealthStatus::Healthy) => "healthy".to_string(), // Events can be optional
+        (HealthStatus::Unhealthy, _, _) => "unhealthy".to_string(), // Database is critical
+        (_, _, HealthStatus::Unhealthy) => "unhealthy".to_string(), // Domain service is critical
         _ => "degraded".to_string(),
     }
 }
@@ -189,6 +296,7 @@ mod tests {
             domain_service: Arc::new(MockTaskService::new()),
             event_service: Arc::new(EventService::new().await.unwrap()),
             logger: Arc::new(tyl_logging::loggers::console::ConsoleLogger::new()),
+            tracer: Arc::new(tyl_tracing::SimpleTracer::new(tyl_tracing::TraceConfig::new("test-service"))),
         }
     }
 
@@ -226,5 +334,40 @@ mod tests {
         
         assert!(!response.status.is_empty());
         assert!(!response.service.is_empty());
+        
+        // Check that all dependencies are present
+        assert_eq!(response.dependencies.database.name, "FalkorDB (tyl_tasks)");
+        assert_eq!(response.dependencies.event_system.name, "Event System");
+        assert_eq!(response.dependencies.domain_service.name, "Task Domain Service");
+        
+        // Check that response times are recorded
+        assert!(response.dependencies.database.response_time_ms.is_some());
+        assert!(response.dependencies.event_system.response_time_ms.is_some());
+        assert!(response.dependencies.domain_service.response_time_ms.is_some());
+    }
+    
+    #[tokio::test]
+    async fn test_dependency_health_checks() {
+        let state = create_test_state().await;
+        let dependencies = check_dependencies(&state).await;
+        
+        // Database should be healthy (using MockTaskService)
+        assert!(matches!(dependencies.database.status, HealthStatus::Healthy));
+        assert!(dependencies.database.message.is_some());
+        
+        // Event system should be healthy (enabled by default)
+        assert!(matches!(dependencies.event_system.status, HealthStatus::Healthy));
+        
+        // Domain service should be healthy (mock service)
+        assert!(matches!(dependencies.domain_service.status, HealthStatus::Healthy));
+    }
+    
+    #[tokio::test]
+    async fn test_service_readiness() {
+        let state = create_test_state().await;
+        let is_ready = check_service_readiness(&state).await;
+        
+        // Service should be ready with mock components
+        assert!(is_ready);
     }
 }

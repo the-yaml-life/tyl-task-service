@@ -46,8 +46,8 @@
 // Re-export TYL framework functionality
 pub use tyl_errors::{TylError, TylResult};
 pub use tyl_config::ConfigManager;
-pub use tyl_logging::{Logger, LogRecord};
-pub use tyl_tracing::Span;
+pub use tyl_logging::{Logger, LogRecord, LogLevel, ConsoleLogger, JsonLogger};
+pub use tyl_tracing::{TracingManager, SimpleTracer, TraceConfig};
 
 // Standard library imports
 use std::sync::Arc;
@@ -65,11 +65,13 @@ pub mod handlers;
 pub mod adapters;
 pub mod routes;
 pub mod events;
+pub mod validation;
 
 // Re-exports for convenience
 pub use config::{TaskServiceConfig, DatabaseConfig, ApiConfig};
-pub use domain::{TaskService, Task, CreateTaskRequest, TaskResponse};
+pub use domain::{TaskService, Task, CreateTaskRequest, TaskDetailResponse, TaskDomainService};
 pub use events::{EventService, DomainEventHandler};
+pub use adapters::GraphTaskRepository;
 
 /// Result type for task service operations
 pub type TaskServiceResult<T> = Result<T, TaskServiceError>;
@@ -83,6 +85,9 @@ pub enum TaskServiceError {
     #[error("Database error: {message}")]
     Database { message: String },
     
+    #[error("Graph database error: {message}")]
+    GraphDatabase { message: String },
+    
     #[error("API error: {message}")]
     Api { message: String },
     
@@ -92,8 +97,38 @@ pub enum TaskServiceError {
     #[error("External service error: {message}")]
     ExternalService { message: String },
     
-    #[error("Invalid input: {message}")]
-    InvalidInput { message: String },
+    #[error("Invalid input: {field}: {message}")]
+    InvalidInput { field: String, message: String },
+    
+    #[error("Task not found: {id}")]
+    TaskNotFound { id: String },
+    
+    #[error("Project not found: {id}")]
+    ProjectNotFound { id: String },
+    
+    #[error("User not found: {id}")]
+    UserNotFound { id: String },
+    
+    #[error("Invalid status transition from {from:?} to {to:?}")]
+    InvalidStatusTransition { from: String, to: String },
+    
+    #[error("Circular dependency detected: {path}")]
+    CircularDependency { path: String },
+    
+    #[error("Task dependency violation: {message}")]
+    DependencyViolation { message: String },
+    
+    #[error("Authentication error: {message}")]
+    Authentication { message: String },
+    
+    #[error("Authorization error: {message}")]
+    Authorization { message: String },
+    
+    #[error("Event publishing error: {event_type}: {message}")]
+    EventPublishing { event_type: String, message: String },
+    
+    #[error("Concurrency error: {message}")]
+    Concurrency { message: String },
 }
 
 impl From<TaskServiceError> for TylError {
@@ -101,10 +136,29 @@ impl From<TaskServiceError> for TylError {
         match err {
             TaskServiceError::Configuration { message } => TylError::configuration(message),
             TaskServiceError::Database { message } => TylError::database(message),
+            TaskServiceError::GraphDatabase { message } => TylError::database(format!("Graph DB: {}", message)),
             TaskServiceError::Api { message } => TylError::network(message),
             TaskServiceError::Domain { message } => TylError::validation("domain", message),
             TaskServiceError::ExternalService { message } => TylError::network(message),
-            TaskServiceError::InvalidInput { message } => TylError::validation("input", message),
+            TaskServiceError::InvalidInput { field, message } => TylError::validation(&field, message),
+            TaskServiceError::TaskNotFound { id } => TylError::not_found("task", id),
+            TaskServiceError::ProjectNotFound { id } => TylError::not_found("project", id),
+            TaskServiceError::UserNotFound { id } => TylError::not_found("user", id),
+            TaskServiceError::InvalidStatusTransition { from, to } => {
+                TylError::validation("status", format!("Cannot transition from {} to {}", from, to))
+            },
+            TaskServiceError::CircularDependency { path } => {
+                TylError::validation("dependencies", format!("Circular dependency: {}", path))
+            },
+            TaskServiceError::DependencyViolation { message } => {
+                TylError::validation("dependencies", message)
+            },
+            TaskServiceError::Authentication { message } => TylError::internal(format!("Authentication error: {}", message)),
+            TaskServiceError::Authorization { message } => TylError::internal(format!("Authorization error: {}", message)),
+            TaskServiceError::EventPublishing { event_type, message } => {
+                TylError::internal(format!("Event {} publishing failed: {}", event_type, message))
+            },
+            TaskServiceError::Concurrency { message } => TylError::internal(format!("Concurrency error: {}", message)),
         }
     }
 }
@@ -116,22 +170,41 @@ pub struct AppState {
     pub domain_service: Arc<dyn TaskService + Send + Sync>,
     pub event_service: Arc<EventService>,
     pub logger: Arc<dyn Logger + Send + Sync>,
+    pub tracer: Arc<dyn TracingManager + Send + Sync>,
 }
 
 /// Create the main application with all routes and middleware
 pub async fn create_app(config: TaskServiceConfig) -> TaskServiceResult<Router> {
-    // Initialize TYL framework components
-    let logger = Arc::new(tyl_logging::loggers::console::ConsoleLogger::new());
+    // Initialize TYL logging based on configuration
+    let logger: Arc<dyn Logger + Send + Sync> = match config.monitoring.log_format.as_str() {
+        "json" => Arc::new(JsonLogger::new()),
+        _ => Arc::new(ConsoleLogger::new()),
+    };
+    
+    // Initialize TYL tracing 
+    let trace_config = TraceConfig::new(&config.service_name)
+        .with_sampling_rate(config.monitoring.trace_sampling_rate)
+        .with_max_spans(config.monitoring.max_spans);
+    let tracer = Arc::new(SimpleTracer::new(trace_config));
+    
+    // Log service initialization
+    logger.log(&LogRecord::new(LogLevel::Info, &format!(
+        "Initializing {} v{}", config.service_name, config.version
+    )));
     
     // Initialize event service
     let event_service = Arc::new(EventService::new().await.map_err(|e| {
-        TaskServiceError::Configuration {
-            message: format!("Failed to initialize event service: {}", e),
-        }
+        let error_msg = format!("Failed to initialize event service: {}", e);
+        logger.log(&LogRecord::new(LogLevel::Error, &error_msg));
+        TaskServiceError::Configuration { message: error_msg }
     })?);
     
     // Initialize domain service with dependencies
+    logger.log(&LogRecord::new(LogLevel::Debug, "Initializing domain service and database connection"));
     let domain_service = create_domain_service(&config).await?;
+    logger.log(&LogRecord::new(LogLevel::Info, "Domain service initialized successfully"));
+    
+    logger.log(&LogRecord::new(LogLevel::Info, "All components initialized successfully"));
     
     // Create shared application state
     let state = AppState {
@@ -139,6 +212,7 @@ pub async fn create_app(config: TaskServiceConfig) -> TaskServiceResult<Router> 
         domain_service,
         event_service,
         logger,
+        tracer,
     };
 
     // Build the application with routes and middleware
@@ -159,14 +233,25 @@ pub async fn create_app(config: TaskServiceConfig) -> TaskServiceResult<Router> 
 async fn create_domain_service(
     config: &TaskServiceConfig,
 ) -> TaskServiceResult<Arc<dyn TaskService + Send + Sync>> {
-    // This is where you'd inject your specific domain service implementation
-    // Example:
-    // let db_adapter = create_database_adapter(&config.database).await?;
-    // let external_client = create_http_client(&config.external_apis)?;
-    // let service = Arc::new(UserServiceImpl::new(db_adapter, external_client));
+    // Create FalkorDB adapter using tyl-config RedisConfig
+    let db_adapter = tyl_falkordb_adapter::FalkorDBAdapter::new(
+        config.database.redis.clone(),
+        config.database.graph_name.clone(),
+    ).await.map_err(|e| TaskServiceError::Database {
+        message: format!("Failed to create FalkorDB adapter for graph '{}': {}", 
+                        config.database.graph_name, e),
+    })?;
+
+    // Create graph repository
+    let repository = adapters::GraphTaskRepository::new(
+        db_adapter,
+        config.database.graph_name.clone(),
+    );
+
+    // Create domain service with real repository
+    let service = domain::TaskDomainService::new(repository);
     
-    // For template purposes, return a mock implementation
-    Ok(Arc::new(domain::MockTaskService::new()))
+    Ok(Arc::new(service))
 }
 
 /// Start the microservice with graceful shutdown

@@ -18,7 +18,9 @@ tyl-errors = { git = "https://github.com/the-yaml-life/tyl-errors.git", branch =
 tyl-config = { git = "https://github.com/the-yaml-life/tyl-config.git", branch = "main" }
 tyl-logging = { git = "https://github.com/the-yaml-life/tyl-logging.git", branch = "main" }
 tyl-tracing = { git = "https://github.com/the-yaml-life/tyl-tracing.git", branch = "main" }
-tyl-pubsub-port = { path = "../tyl-pubsub-port" }
+tyl-pubsub-port = { git = "https://github.com/the-yaml-life/tyl-pubsub-port.git", branch = "main" }
+tyl-graph-port = { git = "https://github.com/the-yaml-life/tyl-graph-port.git", branch = "main" }
+tyl-falkordb-adapter = { git = "https://github.com/the-yaml-life/tyl-falkordb-adapter.git", branch = "main" }
 
 # Core microservice dependencies
 tokio = { version = "1.0", features = ["full"] }

@@ -1,0 +1,782 @@
+name: Docker Release & Artifacts
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: 'Create GitHub release'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # ==========================================
+  # Multi-Platform Docker Build
+  # ==========================================
+  docker-build:
+    name: Build Multi-Platform Docker Images
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+      image-tags: ${{ steps.meta.outputs.tags }}
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v3
+      with:
+        platforms: all
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      with:
+        driver-opts: |
+          network=host
+
+    - name: Login to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=semver,pattern={{version}}
+          type=semver,pattern={{major}}.{{minor}}
+          type=semver,pattern={{major}}
+          type=raw,value=latest,enable={{is_default_branch}}
+          type=sha,prefix={{branch}}-
+        labels: |
+          org.opencontainers.image.title=TYL Task Service
+          org.opencontainers.image.description=Task management microservice built with TYL framework
+          org.opencontainers.image.vendor=The YAML Life
+          org.opencontainers.image.licenses=AGPL-3.0
+
+    - name: Build and push Docker image
+      id: build
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: ./Dockerfile
+        platforms: linux/amd64,linux/arm64
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        build-args: |
+          BUILDTIME=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.created'] }}
+          VERSION=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.version'] }}
+          REVISION=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.revision'] }}
+
+    - name: Build test image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: ./Dockerfile.test
+        platforms: linux/amd64,linux/arm64
+        push: true
+        tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:test-${{ github.sha }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+  # ==========================================
+  # Generate Comprehensive Docker Artifacts
+  # ==========================================
+  docker-artifacts:
+    name: Generate Docker Deployment Package
+    runs-on: ubuntu-latest
+    needs: [docker-build]
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Create comprehensive Docker artifacts
+      run: |
+        # Create artifacts directory structure
+        mkdir -p docker-package/{deployment,docs,scripts,configs,examples}
+        
+        # ====================================
+        # Copy Docker files
+        # ====================================
+        cp Dockerfile docker-package/deployment/
+        cp Dockerfile.test docker-package/deployment/
+        cp docker-compose.yml docker-package/deployment/
+        cp .dockerignore docker-package/deployment/
+        
+        # ====================================
+        # Copy configurations
+        # ====================================
+        cp -r config/ docker-package/configs/
+        cp .env.example docker-package/configs/env.example
+        
+        # ====================================
+        # Create deployment scripts
+        # ====================================
+        
+        # Production deployment script
+        cat > docker-package/scripts/deploy-production.sh << 'EOF'
+        #!/bin/bash
+        # TYL Task Service - Production Deployment Script
+        set -e
+
+        echo "🚀 Deploying TYL Task Service to Production"
+        echo "=============================================="
+
+        # Configuration
+        IMAGE_TAG=${1:-latest}
+        COMPOSE_FILE=${2:-docker-compose.yml}
+
+        # Pre-deployment checks
+        echo "📋 Running pre-deployment checks..."
+        
+        # Check Docker
+        if ! command -v docker &> /dev/null; then
+            echo "❌ Docker is not installed"
+            exit 1
+        fi
+
+        # Check Docker Compose
+        if ! docker compose version &> /dev/null; then
+            echo "❌ Docker Compose is not available"
+            exit 1
+        fi
+
+        # Check ports
+        for port in 3000 6379 6380; do
+            if lsof -Pi :$port -sTCP:LISTEN -t >/dev/null 2>&1; then
+                echo "⚠️  Port $port is already in use"
+                read -p "Continue anyway? (y/N): " -n 1 -r
+                echo
+                if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+                    exit 1
+                fi
+            fi
+        done
+
+        echo "✅ Pre-deployment checks passed"
+
+        # Pull latest images
+        echo "📥 Pulling latest images..."
+        docker compose -f $COMPOSE_FILE pull
+
+        # Start services
+        echo "🐳 Starting services..."
+        docker compose -f $COMPOSE_FILE up -d
+
+        # Health check
+        echo "🏥 Waiting for services to be healthy..."
+        sleep 15
+
+        max_attempts=30
+        attempt=0
+        while [ $attempt -lt $max_attempts ]; do
+            if curl -f http://localhost:3000/health > /dev/null 2>&1; then
+                echo "✅ Service is healthy!"
+                break
+            fi
+            attempt=$((attempt + 1))
+            echo "⏳ Attempt $attempt/$max_attempts - waiting for health check..."
+            sleep 5
+        done
+
+        if [ $attempt -eq $max_attempts ]; then
+            echo "❌ Health check failed after $max_attempts attempts"
+            echo "📋 Service logs:"
+            docker compose -f $COMPOSE_FILE logs tyl-task-service
+            exit 1
+        fi
+
+        # Display status
+        echo ""
+        echo "🎉 Deployment completed successfully!"
+        echo "📊 Service Status:"
+        docker compose -f $COMPOSE_FILE ps
+        echo ""
+        echo "🌐 Service URLs:"
+        echo "   API: http://localhost:3000"
+        echo "   Health: http://localhost:3000/health"
+        echo "   Docs: http://localhost:3000/health/detail"
+        echo ""
+        echo "📋 Management Commands:"
+        echo "   Logs: docker compose -f $COMPOSE_FILE logs -f"
+        echo "   Stop: docker compose -f $COMPOSE_FILE down"
+        echo "   Restart: docker compose -f $COMPOSE_FILE restart"
+        EOF
+        
+        # Development deployment script
+        cat > docker-package/scripts/deploy-development.sh << 'EOF'
+        #!/bin/bash
+        # TYL Task Service - Development Deployment Script
+        set -e
+
+        echo "🛠️  Deploying TYL Task Service for Development"
+        echo "==============================================="
+
+        # Build local image
+        echo "🔨 Building local Docker image..."
+        docker build -t tyl-task-service:dev .
+
+        # Start with development configuration
+        echo "🚀 Starting development environment..."
+        COMPOSE_FILE=docker-compose.yml docker compose up -d --build
+
+        # Run tests
+        echo "🧪 Running quick health tests..."
+        sleep 10
+
+        if curl -f http://localhost:3000/health > /dev/null 2>&1; then
+            echo "✅ Development environment is ready!"
+            echo "🌐 API: http://localhost:3000"
+            echo "📋 Health: http://localhost:3000/health"
+        else
+            echo "❌ Development environment health check failed"
+            docker compose logs tyl-task-service
+            exit 1
+        fi
+        EOF
+        
+        # Monitoring script
+        cat > docker-package/scripts/monitor.sh << 'EOF'
+        #!/bin/bash
+        # TYL Task Service - Monitoring Script
+
+        echo "📊 TYL Task Service - System Monitor"
+        echo "====================================="
+
+        while true; do
+            clear
+            echo "📊 TYL Task Service - System Monitor"
+            echo "====================================="
+            echo "🕐 $(date)"
+            echo ""
+            
+            # Service status
+            echo "🐳 Docker Services:"
+            docker compose ps --format "table"
+            echo ""
+            
+            # Health check
+            echo "🏥 Health Status:"
+            if curl -s http://localhost:3000/health | grep -q "healthy"; then
+                echo "✅ API Service: HEALTHY"
+            else
+                echo "❌ API Service: UNHEALTHY"
+            fi
+            
+            # System resources
+            echo ""
+            echo "💾 System Resources:"
+            echo "CPU: $(top -bn1 | grep "Cpu(s)" | awk '{print $2}' | cut -d'%' -f1)%"
+            echo "Memory: $(free -h | awk 'NR==2{printf "%.1f%%", $3*100/$2}')"
+            echo "Disk: $(df -h / | awk 'NR==2{print $5}')"
+            
+            # Container stats
+            echo ""
+            echo "📈 Container Stats:"
+            docker stats --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.NetIO}}" | head -n 5
+            
+            echo ""
+            echo "🔄 Refreshing in 30 seconds... (Ctrl+C to exit)"
+            sleep 30
+        done
+        EOF
+        
+        # Backup script
+        cat > docker-package/scripts/backup.sh << 'EOF'
+        #!/bin/bash
+        # TYL Task Service - Backup Script
+        set -e
+
+        BACKUP_DIR=${1:-./backups}
+        TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+
+        echo "💾 Creating backup: $TIMESTAMP"
+        mkdir -p $BACKUP_DIR
+
+        # Backup FalkorDB data
+        echo "📊 Backing up FalkorDB..."
+        docker compose exec falkordb redis-cli --raw BGSAVE || echo "⚠️  Manual backup needed"
+
+        # Backup configuration
+        echo "⚙️  Backing up configuration..."
+        tar -czf $BACKUP_DIR/config_$TIMESTAMP.tar.gz config/ .env* || echo "⚠️  Config backup partial"
+
+        # Backup logs
+        echo "📋 Backing up logs..."
+        docker compose logs > $BACKUP_DIR/service_logs_$TIMESTAMP.log
+
+        echo "✅ Backup completed: $BACKUP_DIR"
+        ls -la $BACKUP_DIR/*$TIMESTAMP*
+        EOF
+        
+        # Make scripts executable
+        chmod +x docker-package/scripts/*.sh
+        
+        # ====================================
+        # Create documentation
+        # ====================================
+        
+        # Main README
+        cat > docker-package/README.md << 'EOF'
+        # TYL Task Service - Docker Deployment Package
+
+        Complete Docker deployment package for the TYL Task Service microservice.
+
+        ## 📦 Package Contents
+
+        ```
+        docker-package/
+        ├── deployment/          # Docker files
+        │   ├── Dockerfile       # Production image
+        │   ├── Dockerfile.test  # Test image
+        │   ├── docker-compose.yml
+        │   └── .dockerignore
+        ├── configs/             # Configuration files
+        │   ├── config/          # Service configuration
+        │   └── env.example      # Environment template
+        ├── scripts/             # Deployment scripts
+        │   ├── deploy-production.sh
+        │   ├── deploy-development.sh
+        │   ├── monitor.sh
+        │   └── backup.sh
+        ├── docs/                # Documentation
+        └── examples/            # Usage examples
+        ```
+
+        ## 🚀 Quick Start
+
+        ### Production Deployment
+        ```bash
+        cd deployment
+        cp ../configs/env.example .env
+        # Edit .env with your configuration
+        ../scripts/deploy-production.sh
+        ```
+
+        ### Development Deployment
+        ```bash
+        cd deployment
+        ../scripts/deploy-development.sh
+        ```
+
+        ## 🔧 Configuration
+
+        1. Copy environment template:
+           ```bash
+           cp configs/env.example deployment/.env
+           ```
+
+        2. Edit configuration:
+           ```bash
+           # Required settings
+           FALKORDB_PASSWORD=your-secure-password
+           REDIS_PUBSUB_PASSWORD=your-secure-password
+           
+           # Optional settings
+           PORT=3000
+           RUST_LOG=info,tyl_task_service=debug
+           ```
+
+        3. Deploy:
+           ```bash
+           scripts/deploy-production.sh
+           ```
+
+        ## 📊 Monitoring
+
+        - **Health Check**: `curl http://localhost:3000/health`
+        - **Live Monitor**: `scripts/monitor.sh`
+        - **Logs**: `docker compose logs -f tyl-task-service`
+        - **Stats**: `docker stats`
+
+        ## 🔄 Management
+
+        | Command | Description |
+        |---------|-------------|
+        | `scripts/deploy-production.sh` | Deploy to production |
+        | `scripts/deploy-development.sh` | Deploy for development |
+        | `scripts/monitor.sh` | Real-time monitoring |
+        | `scripts/backup.sh` | Create backup |
+        | `docker compose down` | Stop services |
+        | `docker compose restart` | Restart services |
+
+        ## 🌐 Service URLs
+
+        - **API**: http://localhost:3000
+        - **Health**: http://localhost:3000/health
+        - **Health Detail**: http://localhost:3000/health/detail
+
+        ## 🔧 Troubleshooting
+
+        ### Common Issues
+
+        1. **Port conflicts**: Check if ports 3000, 6379, 6380 are available
+        2. **Permission errors**: Ensure Docker daemon is running
+        3. **Health check fails**: Check logs with `docker compose logs`
+
+        ### Debug Commands
+
+        ```bash
+        # Check service status
+        docker compose ps
+
+        # View logs
+        docker compose logs tyl-task-service
+
+        # Access container
+        docker compose exec tyl-task-service bash
+
+        # Check database
+        docker compose exec falkordb redis-cli
+        ```
+
+        ## 📋 Requirements
+
+        - Docker 20.10+
+        - Docker Compose v2.0+
+        - 2GB RAM minimum
+        - 1GB disk space
+
+        ## 🆘 Support
+
+        For issues and support:
+        - GitHub Issues: [Repository Issues](https://github.com/the-yaml-life/tyl-task-service/issues)
+        - Documentation: See `docs/` directory
+        EOF
+        
+        # Deployment guide
+        cat > docker-package/docs/deployment-guide.md << 'EOF'
+        # TYL Task Service - Deployment Guide
+
+        ## Production Deployment Checklist
+
+        ### Pre-Deployment
+        - [ ] Server meets requirements (Docker 20.10+, 2GB RAM, 1GB disk)
+        - [ ] Firewall configured for ports 3000, 6379, 6380
+        - [ ] DNS/Load balancer pointing to server
+        - [ ] SSL certificate ready (if using HTTPS)
+        - [ ] Backup strategy in place
+
+        ### Environment Configuration
+        - [ ] `.env` file configured with production values
+        - [ ] Database passwords set (strong passwords)
+        - [ ] Logging level appropriate for production
+        - [ ] Health check intervals configured
+
+        ### Deployment Steps
+        1. Upload deployment package to server
+        2. Extract: `tar -xzf docker-artifacts.tar.gz`
+        3. Configure: `cp configs/env.example deployment/.env`
+        4. Deploy: `scripts/deploy-production.sh`
+        5. Verify: Check health endpoints
+        6. Monitor: Use `scripts/monitor.sh`
+
+        ### Post-Deployment
+        - [ ] Health checks passing
+        - [ ] Monitoring configured
+        - [ ] Backup scheduled
+        - [ ] Log rotation configured
+        - [ ] Alert notifications set up
+
+        ## Scaling Considerations
+
+        ### Horizontal Scaling
+        - Use load balancer for multiple instances
+        - Share FalkorDB instance across services
+        - Configure Redis cluster for high availability
+
+        ### Vertical Scaling
+        - Increase memory limits in docker-compose.yml
+        - Adjust worker threads in service configuration
+        - Monitor resource usage with scripts/monitor.sh
+
+        ## Security Best Practices
+
+        1. **Network Security**
+           - Use private networks for inter-service communication
+           - Expose only necessary ports
+           - Configure firewall rules
+
+        2. **Data Security**
+           - Use strong passwords for databases
+           - Enable TLS for external connections
+           - Regular security updates
+
+        3. **Access Control**
+           - Limit container privileges
+           - Use non-root users in containers
+           - Implement API authentication
+
+        ## Backup & Recovery
+
+        ### Automated Backups
+        ```bash
+        # Daily backup cron job
+        0 2 * * * /path/to/scripts/backup.sh /backups/daily/
+
+        # Weekly full backup
+        0 1 * * 0 /path/to/scripts/backup.sh /backups/weekly/
+        ```
+
+        ### Recovery Process
+        1. Stop services: `docker compose down`
+        2. Restore data from backup
+        3. Start services: `docker compose up -d`
+        4. Verify health: `curl http://localhost:3000/health`
+        EOF
+        
+        # ====================================
+        # Create examples
+        # ====================================
+        
+        # API usage examples
+        cat > docker-package/examples/api-usage.sh << 'EOF'
+        #!/bin/bash
+        # TYL Task Service - API Usage Examples
+
+        BASE_URL=${1:-http://localhost:3000}
+
+        echo "🌐 TYL Task Service API Examples"
+        echo "================================"
+        echo "Base URL: $BASE_URL"
+        echo ""
+
+        # Health check
+        echo "📋 Health Check:"
+        curl -s "$BASE_URL/health" | jq . || echo "Health check failed"
+        echo ""
+
+        # Create task
+        echo "➕ Creating task:"
+        TASK_RESPONSE=$(curl -s -X POST "$BASE_URL/api/v1/tasks" \
+          -H "Content-Type: application/json" \
+          -d '{
+            "name": "Example Task",
+            "description": "This is an example task",
+            "context": "work",
+            "priority": "high",
+            "complexity": "medium"
+          }')
+        
+        echo $TASK_RESPONSE | jq . || echo "Task creation failed"
+        
+        # Extract task ID
+        TASK_ID=$(echo $TASK_RESPONSE | jq -r '.id // empty')
+        echo "Created task ID: $TASK_ID"
+        echo ""
+
+        if [ ! -z "$TASK_ID" ]; then
+            # Get task
+            echo "📖 Getting task $TASK_ID:"
+            curl -s "$BASE_URL/api/v1/tasks/$TASK_ID" | jq . || echo "Get task failed"
+            echo ""
+            
+            # List tasks
+            echo "📋 Listing tasks:"
+            curl -s "$BASE_URL/api/v1/tasks" | jq . || echo "List tasks failed"
+            echo ""
+        fi
+
+        echo "✅ API examples completed"
+        EOF
+        
+        chmod +x docker-package/examples/api-usage.sh
+        
+        # Performance test example
+        cat > docker-package/examples/load-test.sh << 'EOF'
+        #!/bin/bash
+        # Simple load test for TYL Task Service
+
+        BASE_URL=${1:-http://localhost:3000}
+        REQUESTS=${2:-100}
+        CONCURRENT=${3:-10}
+
+        echo "🚀 Load Testing TYL Task Service"
+        echo "================================"
+        echo "URL: $BASE_URL"
+        echo "Requests: $REQUESTS"
+        echo "Concurrent: $CONCURRENT"
+        echo ""
+
+        # Install dependencies if needed
+        if ! command -v ab &> /dev/null; then
+            echo "Installing apache2-utils for load testing..."
+            sudo apt-get update && sudo apt-get install -y apache2-utils
+        fi
+
+        # Test health endpoint
+        echo "📋 Testing health endpoint:"
+        ab -n $REQUESTS -c $CONCURRENT "$BASE_URL/health"
+        echo ""
+
+        # Test task creation (requires JSON)
+        echo "➕ Testing task creation:"
+        # Create a temporary file with JSON payload
+        cat > /tmp/task.json << 'JSON'
+        {
+          "name": "Load Test Task",
+          "description": "Task created during load testing",
+          "context": "work",
+          "priority": "low",
+          "complexity": "simple"
+        }
+        JSON
+
+        ab -n $((REQUESTS/10)) -c $((CONCURRENT/2)) -p /tmp/task.json -T application/json "$BASE_URL/api/v1/tasks"
+        
+        rm /tmp/task.json
+        echo ""
+        echo "✅ Load test completed"
+        EOF
+        
+        chmod +x docker-package/examples/load-test.sh
+        
+        # ====================================
+        # Create final package
+        # ====================================
+        echo "📦 Creating Docker artifacts package..."
+        tar -czf docker-artifacts.tar.gz docker-package/
+        
+        # Create checksums
+        sha256sum docker-artifacts.tar.gz > docker-artifacts.tar.gz.sha256
+        
+        echo "✅ Docker artifacts package created successfully!"
+        echo "📁 Package: docker-artifacts.tar.gz"
+        echo "🔒 Checksum: docker-artifacts.tar.gz.sha256"
+        echo ""
+        echo "📋 Package contents:"
+        tar -tzf docker-artifacts.tar.gz | head -20
+        echo "..."
+
+    - name: Upload Docker artifacts package
+      uses: actions/upload-artifact@v4
+      with:
+        name: docker-deployment-package
+        path: |
+          docker-artifacts.tar.gz
+          docker-artifacts.tar.gz.sha256
+
+    - name: Upload individual components
+      uses: actions/upload-artifact@v4
+      with:
+        name: docker-components
+        path: docker-package/
+
+  # ==========================================
+  # Security Scan
+  # ==========================================
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: [docker-build]
+    if: github.event_name == 'push'
+
+    steps:
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+
+    - name: Upload Trivy scan results to GitHub Security tab
+      uses: github/codeql-action/upload-sarif@v3
+      if: always()
+      with:
+        sarif_file: 'trivy-results.sarif'
+
+    - name: Generate security report
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+        format: 'json'
+        output: 'security-report.json'
+
+    - name: Upload security report
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: security-report
+        path: security-report.json
+
+  # ==========================================
+  # Performance Benchmarks
+  # ==========================================
+  benchmarks:
+    name: Performance Benchmarks
+    runs-on: ubuntu-latest
+    needs: [docker-build]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up test environment
+      run: |
+        # Pull the built image
+        docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+        
+        # Start test environment
+        docker compose up -d
+        
+        # Wait for services
+        sleep 30
+
+    - name: Run performance tests
+      run: |
+        # Install Apache Bench
+        sudo apt-get update && sudo apt-get install -y apache2-utils jq
+        
+        # Test health endpoint performance
+        echo "🚀 Testing health endpoint performance"
+        ab -n 1000 -c 10 http://localhost:3000/health > health-benchmark.txt
+        
+        # Test API endpoint performance
+        echo "🚀 Testing API performance"
+        
+        # Create test JSON
+        cat > test-task.json << 'EOF'
+        {
+          "name": "Benchmark Task",
+          "description": "Performance testing task",
+          "context": "work",
+          "priority": "low",
+          "complexity": "simple"
+        }
+        EOF
+        
+        ab -n 100 -c 5 -p test-task.json -T application/json http://localhost:3000/api/v1/tasks > api-benchmark.txt
+        
+        # Cleanup
+        docker compose down
+
+    - name: Upload benchmark results
+      uses: actions/upload-artifact@v4
+      with:
+        name: performance-benchmarks
+        path: |
+          health-benchmark.txt
+          api-benchmark.txt

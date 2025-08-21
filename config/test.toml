@@ -1,0 +1,64 @@
+# Test Environment Configuration for Task Service
+
+[service]
+name = "tyl-task-service-test"
+version = "1.0.0"
+
+[api]
+host = "0.0.0.0"
+port = 3001
+request_timeout_ms = 10000
+max_request_size = 1048576
+
+# FalkorDB configuration (using different database for tests)
+[falkordb]
+host = "falkordb"
+port = 6379
+password = "taskservice123"
+database = 1  # Use different DB for tests
+graph_name = "test_task_management"
+max_connections = 5
+timeout_seconds = 2
+
+# Redis for pub/sub (tests)
+[redis_pubsub]
+host = "redis-pubsub"
+port = 6379
+password = "pubsub123"
+max_connections = 5
+timeout_seconds = 2
+
+[external]
+timeout_ms = 5000
+retry_attempts = 1
+retry_delay_ms = 100
+
+[monitoring]
+metrics_enabled = false
+tracing_enabled = true
+health_check_enabled = true
+
+# Test-specific settings
+[logging]
+level = "debug"
+format = "json"
+
+[cors]
+allowed_origins = ["*"]
+allowed_methods = ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"]
+allowed_headers = ["*"]
+
+# Task service test configuration
+[task_service]
+max_tasks_per_user = 10
+max_subtask_depth = 3
+default_task_priority = "medium"
+auto_assign_on_create = false
+enable_analytics = true
+
+# Event configuration for tests
+[events]
+enabled = true
+batch_size = 10
+flush_interval_ms = 100
+retry_attempts = 1

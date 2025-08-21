@@ -3,7 +3,7 @@
 //! This is the main entry point for the task service microservice.
 //! It initializes the configuration, sets up logging and tracing, and starts the HTTP server.
 
-use tyl_task_service::{TaskServiceConfig, run_microservice};
+use tyl_task_service::{TaskServiceConfig, run_microservice, LogLevel, LogRecord, ConsoleLogger, JsonLogger, Logger};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -14,43 +14,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = TaskServiceConfig::from_env()
         .map_err(|e| format!("Failed to load configuration: {}", e))?;
 
-    // Initialize logging and tracing
-    init_observability(&config)?;
+    // Initialize TYL logging early
+    let logger: Box<dyn Logger> = match config.monitoring.log_format.as_str() {
+        "json" => Box::new(JsonLogger::new()),
+        _ => Box::new(ConsoleLogger::new()),
+    };
 
-    // Print startup information
-    println!("🚀 Starting {} microservice", config.service_name);
-    println!("📝 Version: {}", config.version);
-    println!("🌐 API endpoint: http://{}:{}", config.api.host, config.api.port);
-    println!("📊 Health check: http://{}:{}/health", config.api.host, config.api.port);
+    // Log startup information using TYL logging
+    logger.log(&LogRecord::new(LogLevel::Info, &format!("🚀 Starting {} microservice", config.service_name)));
+    logger.log(&LogRecord::new(LogLevel::Info, &format!("📝 Version: {}", config.version)));
+    logger.log(&LogRecord::new(LogLevel::Info, &format!("🌐 API endpoint: http://{}:{}", config.api.host, config.api.port)));
+    logger.log(&LogRecord::new(LogLevel::Info, &format!("📊 Health check: http://{}:{}/health", config.api.host, config.api.port)));
+    logger.log(&LogRecord::new(LogLevel::Info, &format!("🗄️ Database: {}", config.database_connection_info())));
+    logger.log(&LogRecord::new(LogLevel::Debug, &format!("🔧 Log level: {} | Format: {}", config.monitoring.log_level, config.monitoring.log_format)));
 
     // Start the microservice
     run_microservice(config).await?;
 
-    println!("👋 Microservice shutdown complete");
+    logger.log(&LogRecord::new(LogLevel::Info, "👋 Microservice shutdown complete"));
     Ok(())
 }
 
-/// Initialize logging and tracing for the microservice
-fn init_observability(config: &TaskServiceConfig) -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize structured logging
-    let log_level = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
-    std::env::set_var("RUST_LOG", log_level);
-    
-    // Initialize tracing subscriber for distributed tracing
-    let subscriber = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_target(false)
-        .compact()
-        .finish();
-    
-    tracing::subscriber::set_global_default(subscriber)
-        .map_err(|e| format!("Failed to set tracing subscriber: {}", e))?;
-
-    tracing::info!(
-        service_name = %config.service_name,
-        version = %config.version,
-        "Observability initialized"
-    );
-
-    Ok(())
-}
